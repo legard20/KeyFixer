@@ -1,0 +1,15 @@
+# Build output
+KeyFixer.exe
+*.exe
+*.pdb
+*.zip
+
+# Local agent / working files
+.aeo/
+aeo_skill.md
+
+# IDE / OS
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini
