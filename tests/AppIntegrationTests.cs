@@ -128,7 +128,246 @@ public static class AppIntegrationTests
                 "RTL not set");
         }
 
+        // 8. Problem 3: Navigation keys (PgDn, PgUp, Home, End, Arrows) never swallowed
+        AssertTrue("P3 IsNavigationKey recognizes PgDn/PgUp/Home/End/Arrows",
+            AppSettings.IsNavigationKey(Keys.Next) && AppSettings.IsNavigationKey(Keys.Prior) &&
+            AppSettings.IsNavigationKey(Keys.Home) && AppSettings.IsNavigationKey(Keys.End) &&
+            AppSettings.IsNavigationKey(Keys.Down) && !AppSettings.IsNavigationKey(Keys.Pause) &&
+            !AppSettings.IsNavigationKey(Keys.F9),
+            "navigation key classification mismatch");
+
+        // P3a: PgDn with no selection -> passes through PgDn
+        {
+            FakePlatform env = new FakePlatform();
+            env.CopyProducesSelection = false;
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            AppSettings s = new AppSettings(); // Default PgDn
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(s, null);
+            AssertTrue("P3a PgDn with no selection passes through",
+                o.Status == ReplaceStatus.NoSelectionPassedThrough && o.PassedThrough && env.LastPassThroughKey == Keys.Next,
+                "status=" + o.Status + " passed=" + o.PassedThrough);
+        }
+
+        // P3b: PgDn in standard Win32 Edit control with no selection -> skips Ctrl+C and passes through immediately
+        {
+            FakePlatform env = new FakePlatform();
+            env.EditHasSelection = false;
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P3b PgDn in Edit control with no selection skips Ctrl+C and passes through",
+                o.PassedThrough && env.CtrlCCount == 0 && env.LastPassThroughKey == Keys.Next,
+                "ctrlC=" + env.CtrlCCount + " passed=" + o.PassedThrough);
+        }
+
+        // P3c: PgDn in Windows Terminal -> skips Ctrl+C (never sends SIGINT) and passes through
+        {
+            FakePlatform env = new FakePlatform();
+            env.WindowClassName = "CASCADIA_HOSTING_WINDOW_CLASS";
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P3c PgDn in Terminal skips Ctrl+C and passes through",
+                o.PassedThrough && env.CtrlCCount == 0 && env.LastPassThroughKey == Keys.Next,
+                "ctrlC=" + env.CtrlCCount + " passed=" + o.PassedThrough);
+        }
+
+        // P3d: PgDn when Ctrl+C fails -> still passes through (never swallowed)
+        {
+            FakePlatform env = new FakePlatform();
+            env.FailCtrlC = true;
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P3d PgDn when Ctrl+C fails still passes through",
+                o.PassedThrough && env.LastPassThroughKey == Keys.Next,
+                "passed=" + o.PassedThrough);
+        }
+
+        // P3e: PgUp when selected text needs no change (e.g. valid URL) -> restores clipboard and passes through
+        {
+            FakePlatform env = new FakePlatform();
+            env.SelectedTextToCopy = "https://example.com";
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            AppSettings s = new AppSettings();
+            s.SetHotkey(AppSettings.MOD_NONE, Keys.Prior);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(s, null);
+            AssertTrue("P3e PgUp with unchanged URL passes through and restores clipboard",
+                o.Status == ReplaceStatus.NoChange && o.PassedThrough && o.ClipboardRestored && env.LastPassThroughKey == Keys.Prior,
+                "status=" + o.Status + " passed=" + o.PassedThrough + " restored=" + o.ClipboardRestored);
+        }
+
+        // 9. Problem 4: Window focus check before pasting — cancel safely if focus changed
+        {
+            FakePlatform env = new FakePlatform();
+            env.SelectedTextToCopy = "اثممخ صخقمي";
+            env.SwitchForegroundAfterRead = new IntPtr(0x2222);
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P4a Focus changed to another window cancels paste and restores clipboard",
+                o.Status == ReplaceStatus.CancelledFocusChanged && env.CtrlVCount == 0 &&
+                env.LayoutSwitchCount == 0 && o.ClipboardRestored && env.ClipboardText == "ORIGINAL_USER_CLIP",
+                "status=" + o.Status + " ctrlV=" + env.CtrlVCount + " clip=" + env.ClipboardText);
+        }
+
+        {
+            FakePlatform env = new FakePlatform();
+            env.SelectedTextToCopy = "hgsghl ugd;l";
+            env.SwitchFocusedControlAfterWrite = new IntPtr(0xB002);
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P4b Focused control changed right before Ctrl+V cancels paste and restores clipboard",
+                o.Status == ReplaceStatus.CancelledFocusChanged && env.CtrlVCount == 0 &&
+                o.ClipboardRestored && env.ClipboardText == "ORIGINAL_USER_CLIP",
+                "status=" + o.Status + " ctrlV=" + env.CtrlVCount + " clip=" + env.ClipboardText);
+        }
+
+        // 10. Problem 5: Safe clipboard restore timing & race protection with slow apps
+        {
+            FakePlatform env = new FakePlatform();
+            env.SelectedTextToCopy = "اثممخ صخقمي";
+            env.OpenClipboardPollsRemaining = 4; // Simulates slow app holding clipboard open for 100ms past min delay
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P5a Slow app waits >= 450ms + extra clipboard-open time before restoring",
+                o.Status == ReplaceStatus.Replaced && env.CtrlVCount == 1 &&
+                env.PastedText == "hello world" && o.RestoreWaitMs >= 550 &&
+                o.ClipboardRestored && env.ClipboardText == "ORIGINAL_USER_CLIP",
+                "status=" + o.Status + " waitMs=" + o.RestoreWaitMs + " pasted=" + env.PastedText + " clip=" + env.ClipboardText);
+        }
+
+        {
+            FakePlatform env = new FakePlatform();
+            env.SelectedTextToCopy = "hgsghl ugd;l";
+            env.ExternalClipboardChangeOnSleepStep = 3; // Simulates user copying new text during wait
+            TextReplacer replacer = new TextReplacer(env, 450, 350);
+            ReplaceOutcome o = replacer.ProcessSelectedTextDetailed(new AppSettings(), null);
+            AssertTrue("P5b External clipboard change during wait skips stale restore (never clobbers new copy)",
+                o.Status == ReplaceStatus.Replaced && !o.ClipboardRestored && env.ClipboardText == "NEW_USER_COPY",
+                "restored=" + o.ClipboardRestored + " clip=" + env.ClipboardText);
+        }
+
         Console.WriteLine(string.Format("\nSummary: {0} passed, {1} failed.", _passed, _failed));
         return _failed == 0 ? 0 : 1;
+    }
+
+    private sealed class FakePlatform : IReplacerPlatform
+    {
+        public IntPtr ForegroundWindow = new IntPtr(0x1111);
+        public IntPtr FocusedControl = new IntPtr(0xA001);
+        public string WindowClassName = "Chrome_WidgetWin_1";
+        public bool? EditHasSelection = null;
+        public bool CopyProducesSelection = true;
+        public bool FailCtrlC = false;
+        public string SelectedTextToCopy = "اثممخ صخقمي";
+        public string ClipboardText = "ORIGINAL_USER_CLIP";
+        public string PastedText = null;
+        public uint ClipSeq = 10;
+
+        public IntPtr SwitchForegroundAfterRead = IntPtr.Zero;
+        public IntPtr SwitchFocusedControlAfterWrite = IntPtr.Zero;
+        public int OpenClipboardPollsRemaining = 0;
+        public int ExternalClipboardChangeOnSleepStep = -1;
+
+        public int CtrlCCount = 0;
+        public int CtrlVCount = 0;
+        public int LayoutSwitchCount = 0;
+        public Keys LastPassThroughKey = Keys.None;
+        private int _sleepCallsAfterPaste = 0;
+        private bool _pasteSent = false;
+
+        public IntPtr GetForegroundWindow() { return ForegroundWindow; }
+        public IntPtr GetFocusedControl(IntPtr fg) { return FocusedControl; }
+        public string GetWindowClassName(IntPtr hWnd) { return WindowClassName; }
+        public bool? TryCheckEditControlHasSelection(IntPtr focusedControl) { return EditHasSelection; }
+        public uint GetClipboardSequenceNumber() { return ClipSeq; }
+
+        public IntPtr GetOpenClipboardWindow()
+        {
+            if (OpenClipboardPollsRemaining > 0)
+            {
+                OpenClipboardPollsRemaining--;
+                return ForegroundWindow;
+            }
+            return IntPtr.Zero;
+        }
+
+        public bool IsKeyDown(int vk) { return false; }
+
+        public bool SendCtrlCombo(ushort vkKey)
+        {
+            if (vkKey == 0x43) // C
+            {
+                CtrlCCount++;
+                if (FailCtrlC) return false;
+                if (CopyProducesSelection)
+                {
+                    ClipboardText = SelectedTextToCopy;
+                    ClipSeq++;
+                }
+                return true;
+            }
+            if (vkKey == 0x56) // V
+            {
+                CtrlVCount++;
+                PastedText = ClipboardText;
+                _pasteSent = true;
+                return true;
+            }
+            return true;
+        }
+
+        public bool SendPassThroughKey(uint modifiers, Keys key)
+        {
+            LastPassThroughKey = key;
+            return true;
+        }
+
+        public string ReadClipboardText()
+        {
+            string val = ClipboardText;
+            if (SwitchForegroundAfterRead != IntPtr.Zero)
+            {
+                ForegroundWindow = SwitchForegroundAfterRead;
+            }
+            return val;
+        }
+
+        public bool WriteClipboardText(string text)
+        {
+            ClipboardText = text;
+            ClipSeq++;
+            if (SwitchFocusedControlAfterWrite != IntPtr.Zero)
+            {
+                FocusedControl = SwitchFocusedControlAfterWrite;
+            }
+            return true;
+        }
+
+        public object CaptureClipboardSnapshot() { return ClipboardText; }
+
+        public bool RestoreClipboardSnapshot(object snapshot)
+        {
+            ClipboardText = snapshot as string;
+            ClipSeq++;
+            return true;
+        }
+
+        public void DisposeClipboardSnapshot(object snapshot) { }
+
+        public void SwitchForegroundKeyboardLayout(IntPtr fg, TargetLanguage target)
+        {
+            LayoutSwitchCount++;
+        }
+
+        public void Sleep(int ms)
+        {
+            if (_pasteSent)
+            {
+                _sleepCallsAfterPaste++;
+                if (ExternalClipboardChangeOnSleepStep > 0 && _sleepCallsAfterPaste == ExternalClipboardChangeOnSleepStep)
+                {
+                    ClipboardText = "NEW_USER_COPY";
+                    ClipSeq++;
+                }
+            }
+        }
     }
 }
