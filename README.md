@@ -1,4 +1,4 @@
-# KeyFixer — Arabic ⇄ English Keyboard Layout Fixer (v1.0.0)
+# KeyFixer — Arabic ⇄ English Keyboard Layout Fixer (v1.1.0)
 
 Lightweight open-source Windows background tray utility built with C# / `.NET Framework 4.8` (~57 KB standalone `.exe`, zero external dependencies) — automatically detects and fixes text typed in the wrong Arabic (101) / US English (QWERTY) keyboard layout with a single customizable hotkey.
 
@@ -36,6 +36,14 @@ No SDK or external packages required — compiles directly with the built-in Win
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\build.ps1" -RunTests
 ```
+
+### What's Fixed in v1.1.0
+- Fixed mixed Arabic and English sentences so valid words are not broken or reordered.
+- Fixed URLs, emails, domains, file paths, IPs, and `@handles` so they stay untouched.
+- Fixed PgDn and other navigation keys so scrolling works normally and keys are never blocked.
+- Added a focus check before pasting so text is never pasted into the wrong window.
+- Added a safer wait before restoring the clipboard so slow apps paste the right text.
+- Fixed small cleanup and safety bugs (see `CHANGELOG.md`).
 
 ---
 
