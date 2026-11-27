@@ -13,6 +13,7 @@ namespace KeyFixer
         private readonly Action _onSuspendHotkey;
         private readonly Action _onResumeHotkey;
 
+        private Icon _formIcon;
         private bool _capturingHotkey;
         private TextBox _txtHotkey;
         private Button _btnChangeHotkey;
@@ -55,7 +56,8 @@ namespace KeyFixer
 
             try
             {
-                Icon = TrayIconFactory.CreateTrayIcon(true);
+                _formIcon = TrayIconFactory.CreateTrayIcon(true);
+                Icon = _formIcon;
             }
             catch
             {
@@ -427,6 +429,16 @@ namespace KeyFixer
             _workingSettings.StartWithWindows = _chkStartWithWindows.Checked;
             DialogResult = DialogResult.OK;
             Close();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _formIcon != null)
+            {
+                _formIcon.Dispose();
+                _formIcon = null;
+            }
+            base.Dispose(disposing);
         }
     }
 }

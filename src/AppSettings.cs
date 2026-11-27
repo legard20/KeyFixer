@@ -129,7 +129,25 @@ namespace KeyFixer
 
             JavaScriptSerializer ser = new JavaScriptSerializer();
             string json = ser.Serialize(this);
-            File.WriteAllText(path, json, Encoding.UTF8);
+            string tmpPath = path + ".tmp";
+            File.WriteAllText(tmpPath, json, Encoding.UTF8);
+            if (File.Exists(path))
+            {
+                File.Replace(tmpPath, path, null);
+            }
+            else
+            {
+                File.Move(tmpPath, path);
+            }
+        }
+
+        public static bool IsNavigationKey(Keys key)
+        {
+            Keys code = key & Keys.KeyCode;
+            return code == Keys.Next || code == Keys.Prior ||
+                   code == Keys.Home || code == Keys.End ||
+                   code == Keys.Up || code == Keys.Down ||
+                   code == Keys.Left || code == Keys.Right;
         }
 
         public static bool IsAllowedHotkey(uint modifiers, Keys key)

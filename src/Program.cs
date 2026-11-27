@@ -17,7 +17,7 @@ namespace KeyFixer
             {
                 if (args[0] == "--version")
                 {
-                    Console.WriteLine("KeyFixer 1.0.0");
+                    Console.WriteLine("KeyFixer 1.1.0");
                     return 0;
                 }
                 if (args[0] == "--convert" && args.Length >= 2)
@@ -63,6 +63,7 @@ namespace KeyFixer
         private readonly HotkeyManager _hotkeyManager;
         private readonly TextReplacer _replacer;
         private readonly NotifyIcon _trayIcon;
+        private readonly ContextMenuStrip _trayMenu;
         private readonly Icon _activeIcon;
         private readonly Icon _pausedIcon;
 
@@ -85,9 +86,9 @@ namespace KeyFixer
             _hotkeyManager = new HotkeyManager();
             _hotkeyManager.HotkeyPressed += OnHotkeyPressed;
 
-            ContextMenuStrip menu = new ContextMenuStrip();
-            menu.RightToLeft = RightToLeft.Yes;
-            menu.Font = new Font("Segoe UI", 9.5f);
+            _trayMenu = new ContextMenuStrip();
+            _trayMenu.RightToLeft = RightToLeft.Yes;
+            _trayMenu.Font = new Font("Segoe UI", 9.5f);
 
             _mnuHeader = new ToolStripMenuItem("KeyFixer")
             {
@@ -103,18 +104,18 @@ namespace KeyFixer
             };
             ToolStripMenuItem mnuExit = new ToolStripMenuItem("خروج", null, OnExitClick);
 
-            menu.Items.Add(_mnuHeader);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(_mnuTogglePause);
-            menu.Items.Add(mnuSettings);
-            menu.Items.Add(_mnuStartup);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(mnuExit);
+            _trayMenu.Items.Add(_mnuHeader);
+            _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add(_mnuTogglePause);
+            _trayMenu.Items.Add(mnuSettings);
+            _trayMenu.Items.Add(_mnuStartup);
+            _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add(mnuExit);
 
             _trayIcon = new NotifyIcon
             {
                 Icon = _activeIcon,
-                ContextMenuStrip = menu,
+                ContextMenuStrip = _trayMenu,
                 Visible = true
             };
             _trayIcon.DoubleClick += OnOpenSettingsClick;
@@ -144,7 +145,14 @@ namespace KeyFixer
         private void OnHotkeyPressed(object sender, EventArgs e)
         {
             if (_paused) return;
-            _replacer.ProcessSelectedText(_settings, _hotkeyManager);
+            try
+            {
+                _replacer.ProcessSelectedText(_settings, _hotkeyManager);
+            }
+            catch
+            {
+                // Keep tray app alive if a foreground app or clipboard call throws unexpectedly
+            }
         }
 
         private void OnTogglePauseClick(object sender, EventArgs e)
@@ -296,6 +304,7 @@ namespace KeyFixer
                 _hotkeyManager.Dispose();
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
+                _trayMenu.Dispose();
                 _activeIcon.Dispose();
                 _pausedIcon.Dispose();
             }

@@ -283,19 +283,27 @@ namespace KeyFixer
             List<Token> tokens = Tokenize(text);
             int arabicWordTokens = 0;
             int latinWordTokens = 0;
+            int mixedWordTokens = 0;
 
             for (int i = 0; i < tokens.Count; i++)
             {
                 Token t = tokens[i];
                 if (t.IsWhitespace) continue;
+                if (IsProtectedToken(t.Text))
+                {
+                    t.IsProtected = true;
+                    t.Script = ScriptKind.Neutral;
+                    continue;
+                }
                 ScriptKind kind = ClassifyToken(t.Text);
                 t.Script = kind;
                 if (kind == ScriptKind.Arabic) arabicWordTokens++;
                 else if (kind == ScriptKind.Latin) latinWordTokens++;
+                else if (kind == ScriptKind.Mixed) mixedWordTokens++;
             }
 
-            // Case 1: Pure Arabic-script selection (or heavily Arabic) -> convert entire selection to English
-            if (arabicWordTokens > 0 && latinWordTokens == 0)
+            // Case 1: Pure Arabic-script selection (excluding protected URLs/emails/paths/numbers) -> English
+            if (arabicWordTokens > 0 && latinWordTokens == 0 && mixedWordTokens == 0)
             {
                 result.Direction = ConversionDirection.ArabicToEnglish;
                 result.TargetLanguage = TargetLanguage.English;
@@ -303,8 +311,8 @@ namespace KeyFixer
                 return result;
             }
 
-            // Case 2: Pure Latin-script selection -> convert entire selection to Arabic
-            if (latinWordTokens > 0 && arabicWordTokens == 0)
+            // Case 2: Pure Latin-script selection (excluding protected URLs/emails/paths/numbers) -> Arabic
+            if (latinWordTokens > 0 && arabicWordTokens == 0 && mixedWordTokens == 0)
             {
                 result.Direction = ConversionDirection.EnglishToArabic;
                 result.TargetLanguage = TargetLanguage.Arabic;
@@ -312,9 +320,24 @@ namespace KeyFixer
                 return result;
             }
 
-            // Case 3: No clear letters (e.g., pure punctuation like "؛،؟" or ";,./[]'")
-            if (arabicWordTokens == 0 && latinWordTokens == 0)
+            // Case 3: No clear letters (e.g., pure punctuation like "؛،؟" or ";,./[]'", or only protected tokens)
+            if (arabicWordTokens == 0 && latinWordTokens == 0 && mixedWordTokens == 0)
             {
+                // If every non-whitespace token is protected (e.g. a lone URL or email), leave untouched
+                bool hasUnprotectedNonWs = false;
+                for (int i = 0; i < tokens.Count; i++)
+                {
+                    if (!tokens[i].IsWhitespace && !tokens[i].IsProtected)
+                    {
+                        hasUnprotectedNonWs = true;
+                        break;
+                    }
+                }
+                if (!hasUnprotectedNonWs)
+                {
+                    return result;
+                }
+
                 int arChars = CountArabicMappableChars(text);
                 int enChars = CountEnglishMappableChars(text);
                 if (arChars > enChars)
@@ -332,9 +355,10 @@ namespace KeyFixer
                 return result;
             }
 
-            // Case 4: Truly mixed text (contains BOTH Arabic-script tokens and Latin-script tokens)
+            // Case 4: Truly mixed text (contains BOTH Arabic-script and Latin-script tokens, or mixed-script tokens)
             // Group contiguous non-protected tokens of the same script into runs (phrases)
-            // so even short/ambiguous words inside a mistyped phrase convert cleanly together.
+            // so even short/ambiguous words inside a mistyped phrase convert cleanly together,
+            // while valid Arabic and valid English words stay intact and in exact original order.
             if (smartMixedMode)
             {
                 StringBuilder sb = new StringBuilder(text.Length);
@@ -345,15 +369,24 @@ namespace KeyFixer
                 while (idx < tokens.Count)
                 {
                     Token t = tokens[idx];
-                    if (t.IsWhitespace || IsProtectedToken(t.Text) || t.Script == ScriptKind.Neutral)
+                    if (t.IsWhitespace || t.IsProtected || t.Script == ScriptKind.Neutral)
                     {
                         sb.Append(t.Text);
                         idx++;
                         continue;
                     }
 
+                    if (t.Script == ScriptKind.Mixed)
+                    {
+                        int subEn, subAr;
+                        sb.Append(ConvertMixedTokenSmart(t.Text, out subEn, out subAr));
+                        convertedToEn += subEn;
+                        convertedToAr += subAr;
+                        idx++;
+                        continue;
+                    }
+
                     ScriptKind runScript = t.Script;
-                    int runEnd = idx;
                     int lastScriptToken = idx;
 
                     // Extend run across whitespace and neutral punctuation as long as the next script token matches runScript
@@ -366,7 +399,7 @@ namespace KeyFixer
                             scan++;
                             continue;
                         }
-                        if (IsProtectedToken(cur.Text))
+                        if (cur.IsProtected)
                         {
                             break;
                         }
@@ -383,61 +416,83 @@ namespace KeyFixer
                         }
                         break;
                     }
-                    runEnd = lastScriptToken;
+                    int runEnd = lastScriptToken;
 
-                    // Build the run text and compute aggregate source vs converted score across script tokens in the run
+                    // Build the run text and compute per-word & aggregate source vs converted scores
                     StringBuilder runBuilder = new StringBuilder();
                     double totalSourceScore = 0.0;
                     double totalTargetScore = 0.0;
                     int wordCount = 0;
 
+                    int runLen = runEnd - idx + 1;
+                    double[] tokSource = new double[runLen];
+                    double[] tokTarget = new double[runLen];
+                    bool[] tokIsScript = new bool[runLen];
+                    string[] tokConverted = new string[runLen];
+
                     for (int k = idx; k <= runEnd; k++)
                     {
+                        int rel = k - idx;
                         runBuilder.Append(tokens[k].Text);
-                        if (!tokens[k].IsWhitespace && tokens[k].Script == runScript && !IsProtectedToken(tokens[k].Text))
+                        if (!tokens[k].IsWhitespace && tokens[k].Script == runScript && !tokens[k].IsProtected)
                         {
+                            tokIsScript[rel] = true;
                             wordCount++;
                             if (runScript == ScriptKind.Arabic)
                             {
                                 string cand = ConvertArabicToEnglish(tokens[k].Text);
-                                totalSourceScore += ScoreArabicWord(tokens[k].Text);
-                                totalTargetScore += ScoreEnglishWord(cand);
+                                tokConverted[rel] = cand;
+                                tokSource[rel] = ScoreArabicWord(tokens[k].Text);
+                                tokTarget[rel] = ScoreEnglishWord(cand);
                             }
                             else
                             {
                                 string cand = ConvertEnglishToArabic(tokens[k].Text);
-                                totalSourceScore += ScoreEnglishWord(tokens[k].Text);
-                                totalTargetScore += ScoreArabicWord(cand);
+                                tokConverted[rel] = cand;
+                                tokSource[rel] = ScoreEnglishWord(tokens[k].Text);
+                                tokTarget[rel] = ScoreArabicWord(cand);
                             }
+                            totalSourceScore += tokSource[rel];
+                            totalTargetScore += tokTarget[rel];
                         }
                     }
 
                     string runText = runBuilder.ToString();
                     double avgSource = wordCount > 0 ? totalSourceScore / wordCount : 0.0;
                     double avgTarget = wordCount > 0 ? totalTargetScore / wordCount : 0.0;
+                    double minTarget = (runScript == ScriptKind.Arabic) ? 1.2 : 1.0;
 
-                    if (runScript == ScriptKind.Arabic)
+                    if (avgTarget >= minTarget && avgTarget > avgSource + 1.8)
                     {
-                        if (avgTarget >= 1.2 && avgTarget > avgSource + 1.8)
+                        // Whole run is mistyped gibberish
+                        if (runScript == ScriptKind.Arabic)
                         {
                             sb.Append(ConvertArabicToEnglish(runText));
                             convertedToEn += wordCount;
                         }
                         else
                         {
-                            sb.Append(runText);
+                            sb.Append(ConvertEnglishToArabic(runText));
+                            convertedToAr += wordCount;
                         }
                     }
                     else
                     {
-                        if (avgTarget >= 1.0 && avgTarget > avgSource + 1.8)
+                        // Run may mix valid words and gibberish words of the same script
+                        // (e.g., "اثممخ صخقمي ثم احفظ"). Convert only tokens that are clearly gibberish.
+                        for (int rel = 0; rel < runLen; rel++)
                         {
-                            sb.Append(ConvertEnglishToArabic(runText));
-                            convertedToAr += wordCount;
-                        }
-                        else
-                        {
-                            sb.Append(runText);
+                            int k = idx + rel;
+                            if (tokIsScript[rel] && tokTarget[rel] >= 1.5 && (tokTarget[rel] - tokSource[rel]) >= 3.0)
+                            {
+                                sb.Append(tokConverted[rel]);
+                                if (runScript == ScriptKind.Arabic) convertedToEn++;
+                                else convertedToAr++;
+                            }
+                            else
+                            {
+                                sb.Append(tokens[k].Text);
+                            }
                         }
                     }
 
@@ -456,42 +511,71 @@ namespace KeyFixer
                         result.TargetLanguage = TargetLanguage.None;
                     return result;
                 }
+
+                // All Arabic and English runs in the mixed sentence are already valid:
+                // do NOT wreck the sentence by flipping everything!
+                return result;
             }
 
-            // Fallback if mixed mode found no obvious gibberish (or smartMixedMode is OFF):
-            // Flip the dominant script across the whole text.
-            if (arabicWordTokens >= latinWordTokens)
+            // When smartMixedMode is OFF on mixed text: convert each token according to its own script
+            // while leaving protected tokens (URLs, emails, paths, numbers) and whitespace untouched.
+            StringBuilder manualSb = new StringBuilder(text.Length);
+            for (int i = 0; i < tokens.Count; i++)
             {
-                result.Direction = ConversionDirection.ArabicToEnglish;
-                result.TargetLanguage = TargetLanguage.English;
-                result.ConvertedText = ConvertArabicToEnglish(text);
+                Token t = tokens[i];
+                if (t.IsWhitespace || t.IsProtected || t.Script == ScriptKind.Neutral)
+                {
+                    manualSb.Append(t.Text);
+                }
+                else if (t.Script == ScriptKind.Arabic)
+                {
+                    manualSb.Append(ConvertArabicToEnglish(t.Text));
+                }
+                else if (t.Script == ScriptKind.Latin)
+                {
+                    manualSb.Append(ConvertEnglishToArabic(t.Text));
+                }
+                else
+                {
+                    int dummyEn, dummyAr;
+                    manualSb.Append(ConvertMixedTokenSmart(t.Text, out dummyEn, out dummyAr));
+                }
             }
-            else
-            {
-                result.Direction = ConversionDirection.EnglishToArabic;
-                result.TargetLanguage = TargetLanguage.Arabic;
-                result.ConvertedText = ConvertEnglishToArabic(text);
-            }
+
+            result.Direction = ConversionDirection.MixedSmart;
+            result.TargetLanguage = (arabicWordTokens >= latinWordTokens) ? TargetLanguage.English : TargetLanguage.Arabic;
+            result.ConvertedText = manualSb.ToString();
             return result;
         }
 
         /// <summary>
         /// Converts text typed on a US English keyboard into Windows Arabic (101) characters.
-        /// Handles accidental CapsLock and preserves decimal/thousand separators inside numbers.
+        /// Handles accidental CapsLock and leaves protected tokens (URLs, emails, paths, IPs, handles) untouched.
         /// </summary>
         public static string ConvertEnglishToArabic(string input)
         {
             if (string.IsNullOrEmpty(input)) return input ?? string.Empty;
 
-            // Process whitespace-delimited tokens so CapsLock detection works cleanly per word/segment
+            // Process whitespace-delimited tokens so protected tokens and CapsLock detection work cleanly
             List<Token> tokens = Tokenize(input);
-            bool globalCapsLock = LooksLikeCapsLock(input);
+
+            // Check global CapsLock only across non-protected tokens
+            StringBuilder unprotectedText = new StringBuilder(input.Length);
+            for (int tIdx = 0; tIdx < tokens.Count; tIdx++)
+            {
+                if (!tokens[tIdx].IsWhitespace && !IsProtectedToken(tokens[tIdx].Text))
+                {
+                    unprotectedText.Append(tokens[tIdx].Text);
+                    unprotectedText.Append(' ');
+                }
+            }
+            bool globalCapsLock = LooksLikeCapsLock(unprotectedText.ToString());
             StringBuilder sb = new StringBuilder(input.Length * 2);
 
             for (int tIdx = 0; tIdx < tokens.Count; tIdx++)
             {
                 Token tok = tokens[tIdx];
-                if (tok.IsWhitespace)
+                if (tok.IsWhitespace || IsProtectedToken(tok.Text))
                 {
                     sb.Append(tok.Text);
                     continue;
@@ -535,15 +619,34 @@ namespace KeyFixer
         /// <summary>
         /// Converts text typed on a Windows Arabic (101) keyboard into US English characters.
         /// Handles 2-character ligatures (لا, لأ, لإ, لآ) with context-aware disambiguation
-        /// for لا ('b' vs 'gh' in English words like right/night/thought/enough/high).
+        /// for لا ('b' vs 'gh' in English words like right/night/thought/enough/high),
+        /// and leaves protected tokens (URLs, emails, paths, IPs, handles) untouched.
         /// </summary>
         public static string ConvertArabicToEnglish(string input)
         {
             if (string.IsNullOrEmpty(input)) return input ?? string.Empty;
 
+            List<Token> tokens = Tokenize(input);
             StringBuilder sb = new StringBuilder(input.Length);
-            int len = input.Length;
 
+            for (int tIdx = 0; tIdx < tokens.Count; tIdx++)
+            {
+                Token tok = tokens[tIdx];
+                if (tok.IsWhitespace || IsProtectedToken(tok.Text))
+                {
+                    sb.Append(tok.Text);
+                    continue;
+                }
+
+                ConvertArabicTokenToEnglishInto(tok.Text, sb);
+            }
+
+            return sb.ToString();
+        }
+
+        private static void ConvertArabicTokenToEnglishInto(string input, StringBuilder sb)
+        {
+            int len = input.Length;
             for (int i = 0; i < len; i++)
             {
                 char c = input[i];
@@ -603,8 +706,68 @@ namespace KeyFixer
                     sb.Append(c);
                 }
             }
+        }
 
+        private static string ConvertMixedTokenSmart(string token, out int convertedToEn, out int convertedToAr)
+        {
+            convertedToEn = 0;
+            convertedToAr = 0;
+
+            // Split a single mixed-script token into contiguous Arabic / Latin / Neutral spans
+            StringBuilder sb = new StringBuilder(token.Length);
+            int i = 0;
+            while (i < token.Length)
+            {
+                ScriptKind curKind = ClassifyChar(token[i]);
+                int start = i;
+                while (i < token.Length && ClassifyChar(token[i]) == curKind)
+                {
+                    i++;
+                }
+                string span = token.Substring(start, i - start);
+                if (curKind == ScriptKind.Arabic)
+                {
+                    string cand = ConvertArabicToEnglish(span);
+                    double sAr = ScoreArabicWord(span);
+                    double sEn = ScoreEnglishWord(cand);
+                    if (sEn >= 1.2 && sEn > sAr + 1.8)
+                    {
+                        sb.Append(cand);
+                        convertedToEn++;
+                    }
+                    else
+                    {
+                        sb.Append(span);
+                    }
+                }
+                else if (curKind == ScriptKind.Latin)
+                {
+                    string cand = ConvertEnglishToArabic(span);
+                    double sEn = ScoreEnglishWord(span);
+                    double sAr = ScoreArabicWord(cand);
+                    if (sAr >= 1.0 && sAr > sEn + 1.8)
+                    {
+                        sb.Append(cand);
+                        convertedToAr++;
+                    }
+                    else
+                    {
+                        sb.Append(span);
+                    }
+                }
+                else
+                {
+                    sb.Append(span);
+                }
+            }
             return sb.ToString();
+        }
+
+        private static ScriptKind ClassifyChar(char c)
+        {
+            if (IsArabicLetter(c) || IsArabicDiacritic(c)) return ScriptKind.Arabic;
+            if (IsAsciiLetter(c)) return ScriptKind.Latin;
+            return ScriptKind.Neutral;
         }
 
         private static bool ShouldDecodeLamAlefAsGh(StringBuilder emittedSoFar, string source, int afterIndex)
@@ -989,28 +1152,206 @@ namespace KeyFixer
             return score;
         }
 
-        private static bool IsProtectedToken(string token)
+        private static readonly HashSet<string> KnownTlds = new HashSet<string>
         {
-            string low = token.ToLowerInvariant();
-            if (low.StartsWith("http://") || low.StartsWith("https://") || low.StartsWith("www."))
-                return true;
+            "com","net","org","io","dev","app","gov","edu","co","eg","uk","de","fr","sa","ae",
+            "me","ai","info","biz","tv","gg","xyz","site","online","store","tech","cloud","pro",
+            "link","ly","be","it","es","ru","jp","cn","in","ca","au","nl","se","ch","cc","sh"
+        };
 
-            // Email address check
-            int atIdx = low.IndexOf('@');
-            if (atIdx > 0 && low.IndexOf('.', atIdx) > atIdx + 1)
-                return true;
+        /// <summary>
+        /// Returns true if a token is a URL, domain, email, file path, IP address, version tag,
+        /// social handle/hashtag, hex literal, or pure number/symbol that must never be converted.
+        /// </summary>
+        public static bool IsProtectedToken(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return true;
 
-            // Pure digits/symbols (e.g., 2026, 3.14, +20100)
-            bool hasLetter = false;
-            for (int i = 0; i < token.Length; i++)
+            string core = TrimTokenWrappers(token);
+            if (string.IsNullOrEmpty(core)) return true;
+
+            string low = core.ToLowerInvariant();
+
+            // 1. Explicit URL schemes & www.
+            if (low.StartsWith("http://") || low.StartsWith("https://") ||
+                low.StartsWith("ftp://") || low.StartsWith("mailto:") ||
+                low.StartsWith("file://") || low.StartsWith("www."))
             {
-                if (IsAsciiLetter(token[i]) || IsArabicLetter(token[i]))
+                return true;
+            }
+
+            // 2. Localhost with port/path
+            if (low == "localhost" || low.StartsWith("localhost:") || low.StartsWith("localhost/"))
+            {
+                return true;
+            }
+
+            // 3. Email address (local@domain.tld)
+            int atIdx = low.IndexOf('@');
+            if (atIdx > 0 && atIdx == low.LastIndexOf('@') && atIdx < low.Length - 3)
+            {
+                int dotAfterAt = low.IndexOf('.', atIdx + 2);
+                if (dotAfterAt > atIdx + 1 && dotAfterAt < low.Length - 1)
+                {
+                    string tldPart = low.Substring(low.LastIndexOf('.') + 1);
+                    if (tldPart.Length >= 2 && IsAllAsciiLetters(tldPart))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            // 4. Bare domain / URL without scheme (e.g. github.com/user/repo, docs.google.com, site.co.uk)
+            if (LooksLikeDomainOrUrl(low))
+            {
+                return true;
+            }
+
+            // 5. Windows / UNC / Unix file paths
+            if (core.Length >= 3 && IsAsciiLetter(core[0]) && core[1] == ':' && (core[2] == '\\' || core[2] == '/'))
+            {
+                return true;
+            }
+            if (core.StartsWith(@"\\") && core.Length >= 4)
+            {
+                return true;
+            }
+            if (core.StartsWith("/") && core.IndexOf('/', 1) > 1 && !ContainsArabic(core))
+            {
+                return true;
+            }
+
+            // 6. IPv4 address (with optional :port)
+            if (LooksLikeIpv4(low))
+            {
+                return true;
+            }
+
+            // 7. Version strings (v1.0, v1.0.0, v2.3.1-beta)
+            if (low.Length >= 4 && low[0] == 'v' && char.IsDigit(low[1]) && low.IndexOf('.') >= 2)
+            {
+                return true;
+            }
+
+            // 8. Hex literals (0x4B46)
+            if (low.StartsWith("0x") && low.Length >= 3 && IsHexDigits(low, 2))
+            {
+                return true;
+            }
+
+            // 9. Social @handles (e.g. @legard20)
+            if (core.Length >= 3 && core[0] == '@' && IsAsciiLetter(core[1]) && !ContainsArabic(core))
+            {
+                return true;
+            }
+
+            // 10. Pure digits/symbols (no letters at all: 2026, 3.14, +20100)
+            bool hasLetter = false;
+            for (int i = 0; i < core.Length; i++)
+            {
+                if (IsAsciiLetter(core[i]) || IsArabicLetter(core[i]))
                 {
                     hasLetter = true;
                     break;
                 }
             }
             return !hasLetter;
+        }
+
+        private static string TrimTokenWrappers(string s)
+        {
+            int start = 0;
+            int end = s.Length - 1;
+            while (start <= end && (s[start] == '(' || s[start] == '[' || s[start] == '{' ||
+                                    s[start] == '<' || s[start] == '"' || s[start] == '\''))
+            {
+                start++;
+            }
+            while (end >= start && (s[end] == ')' || s[end] == ']' || s[end] == '}' ||
+                                    s[end] == '>' || s[end] == '"' || s[end] == '\'' ||
+                                    s[end] == ',' || s[end] == '.' || s[end] == ';' ||
+                                    s[end] == ':' || s[end] == '!' || s[end] == '?'))
+            {
+                end--;
+            }
+            if (start > end) return string.Empty;
+            return s.Substring(start, end - start + 1);
+        }
+
+        private static bool LooksLikeDomainOrUrl(string low)
+        {
+            if (ContainsArabic(low)) return false;
+
+            // Isolate host part before '/', '?', '#', ':'
+            int hostEnd = low.Length;
+            for (int i = 0; i < low.Length; i++)
+            {
+                char c = low[i];
+                if (c == '/' || c == '?' || c == '#' || c == ':')
+                {
+                    hostEnd = i;
+                    break;
+                }
+            }
+            if (hostEnd < 4) return false;
+            string host = low.Substring(0, hostEnd);
+            int lastDot = host.LastIndexOf('.');
+            if (lastDot <= 0 || lastDot >= host.Length - 2) return false;
+
+            // Validate host chars (letters, digits, hyphens, dots)
+            for (int i = 0; i < host.Length; i++)
+            {
+                char c = host[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.'))
+                    return false;
+            }
+
+            string tld = host.Substring(lastDot + 1);
+            return KnownTlds.Contains(tld);
+        }
+
+        private static bool LooksLikeIpv4(string s)
+        {
+            int colon = s.IndexOf(':');
+            string ip = (colon > 0) ? s.Substring(0, colon) : s;
+            string[] parts = ip.Split('.');
+            if (parts.Length != 4) return false;
+            for (int i = 0; i < 4; i++)
+            {
+                int val;
+                if (!int.TryParse(parts[i], out val) || val < 0 || val > 255)
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool IsAllAsciiLetters(string s)
+        {
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (!IsAsciiLetter(s[i])) return false;
+            }
+            return s.Length > 0;
+        }
+
+        private static bool IsHexDigits(string s, int startIndex)
+        {
+            for (int i = startIndex; i < s.Length; i++)
+            {
+                char c = s[i];
+                bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) return false;
+            }
+            return true;
+        }
+
+        private static bool ContainsArabic(string s)
+        {
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (IsArabicChar(s[i])) return true;
+            }
+            return false;
         }
 
         private static string TrimEdgePunctuation(string s)
@@ -1039,8 +1380,9 @@ namespace KeyFixer
                 if (IsArabicLetter(c) || IsArabicDiacritic(c)) ar++;
                 else if (IsAsciiLetter(c)) en++;
             }
-            if (ar > 0 && ar >= en) return ScriptKind.Arabic;
-            if (en > 0 && en > ar) return ScriptKind.Latin;
+            if (ar > 0 && en > 0) return ScriptKind.Mixed;
+            if (ar > 0) return ScriptKind.Arabic;
+            if (en > 0) return ScriptKind.Latin;
             return ScriptKind.Neutral;
         }
 
@@ -1097,13 +1439,15 @@ namespace KeyFixer
         {
             Neutral = 0,
             Arabic = 1,
-            Latin = 2
+            Latin = 2,
+            Mixed = 3
         }
 
         private sealed class Token
         {
             public string Text;
             public bool IsWhitespace;
+            public bool IsProtected;
             public ScriptKind Script;
         }
 
